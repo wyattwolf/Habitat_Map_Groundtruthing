@@ -1,0 +1,120 @@
+# Load required libraries
+library(sf)
+library(dplyr)
+library(readr)
+library(caret)
+library(terra)
+
+# ----------- USER CONFIGURATION -------------
+points_csv <- "ArkKaw_Ground_Truthing_Points_32614_cliped2RMoutput.csv"    # Your points file
+polygon_shapefile <- "E:/Gary_Data/Gary_habitat_and_groundtruth/Arkansas_Kaw/ArkKaw_Manual_Substrate_shp/ArkKaw_Manual_HabitatMap_32614_cliped2RMoutput.shp"
+output_csv <- "Manual_ArkKaw_Groundtruth.csv"
+output_confmatrix<-"Manual_ArkKaw_ConfMatrix.txt"
+buffer_m <- 5
+target_crs <- 32614  # EPSG code for UTM Zone 14N
+points_substrate_field <- "FC_Primary_Substrate"
+polygon_substrate_field <- "Name"
+# --------------------------------------------
+
+shapefileCrosswalk <- c(
+  "Un"         = "Un",
+  "BC"         = "BC",
+  "BR"         = "BR",
+  "G"          = "G"
+)
+
+# 1. Read and prep points CSV
+points_df <- read_csv(points_csv, show_col_types = FALSE)
+coord_x <- names(points_df)[tolower(names(points_df)) == "x"][1]
+coord_y <- names(points_df)[tolower(names(points_df)) == "y"][1]
+
+# 2. Load spatial data
+points_sf <- st_as_sf(points_df, coords = c(coord_x, coord_y), crs = target_crs, remove = FALSE)
+polygons_sf <- st_read(polygon_shapefile, quiet = TRUE)
+if (st_crs(polygons_sf)$epsg != target_crs) polygons_sf <- st_transform(polygons_sf, target_crs)
+
+# REMOVE shadow polygons so they are ignored in joins (case-insensitive, trims whitespace)
+polygons_sf <- polygons_sf %>%
+  filter(! tolower(trimws(.data[[polygon_substrate_field]])) %in% "shadow")
+
+# 3. Standardize substrate codes in polygons
+polygons_sf <- polygons_sf %>%
+  mutate(!! polygon_substrate_field := recode(!!sym(polygon_substrate_field), !!!shapefileCrosswalk))
+
+# 4. For each point, find: 
+#    a) The polygon it directly overlays (if any)
+#    b) All polygons within buffer distance
+
+# Direct overlay (no buffer)
+overlay_join <- st_join(points_sf, polygons_sf, join = st_intersects, left = TRUE)
+
+# Buffer join (within 5m)
+points_buffer <- st_buffer(points_sf, dist = buffer_m)
+buffer_join <- st_join(points_buffer, polygons_sf, join = st_intersects, left = TRUE)
+
+# 5. Process each point
+out <- points_sf %>%
+  st_drop_geometry() %>%
+  mutate(
+    Reference = !!sym(points_substrate_field),
+    Prediction = NA_character_
+  )
+
+for (i in 1:nrow(points_sf)) {
+  current_oid <- points_sf$OID[i]
+  reference_substrate <- points_sf[[points_substrate_field]][i]
+  
+  # Get all polygons within buffer for this point
+  buffered_polys <- buffer_join %>%
+    filter(OID == current_oid) %>%
+    filter(!is.na(!! sym(polygon_substrate_field)))
+  
+  # Get the polygon this point directly overlays
+  overlaid_poly <- overlay_join %>%
+    filter(OID == current_oid) %>%
+    filter(!is.na(!!sym(polygon_substrate_field))) %>%
+    slice(1)  # If multiple overlays, take first
+  
+  # Decision logic: 
+  # If correct polygon is within buffer → use it
+  # Else if point overlays a polygon → use that
+  # Else → use nearest polygon
+  
+  correct_in_buffer <- buffered_polys %>%
+    filter(!!sym(polygon_substrate_field) == reference_substrate)
+  
+  if (nrow(correct_in_buffer) > 0) {
+    # Correct polygon IS within 5m → use it
+    out$Prediction[i] <- correct_in_buffer[[polygon_substrate_field]][1]
+    
+  } else if (nrow(overlaid_poly) > 0) {
+    # No correct polygon within 5m, but point overlays a polygon → use overlay
+    out$Prediction[i] <- overlaid_poly[[polygon_substrate_field]][1]
+    
+  } else {
+    # Point doesn't overlay any polygon → find nearest
+    point_geom <- points_sf$geometry[i]
+    polygons_edges <- st_boundary(polygons_sf)
+    closest_idx <- st_nearest_feature(point_geom, polygons_edges)
+    out$Prediction[i] <- polygons_sf[[polygon_substrate_field]][closest_idx]
+  }
+}
+
+# 6. Prepare final output
+out <- out %>%
+  select(OID, !!coord_x, !!coord_y, Reference, Prediction)
+
+# 7. Save to CSV
+write_csv(out, output_csv)
+cat("Spatial caret-ready CSV exported to:  ", output_csv, "\n")
+
+# 8. Confusion matrix using caret (console only, no plot)
+present_levels <- sort(unique(c(out$Reference, out$Prediction)))
+out$Reference <- factor(out$Reference, levels = present_levels)
+out$Prediction <- factor(out$Prediction, levels = present_levels)
+
+cm_caret <- confusionMatrix(out$Prediction, out$Reference)
+sink(output_confmatrix)
+print(cm_caret)
+sink()
+
